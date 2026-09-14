@@ -1,0 +1,6 @@
+{
+  "name": "Smart Exam Hall Seating Arrangement System",
+  "description": "College exam seating order generator with 1 or 2 students per bench, dynamic bench groups, live seating sheet preview, Excel export, and official reference-styled A4 PDF generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

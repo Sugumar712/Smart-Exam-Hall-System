@@ -1,42 +1,41 @@
 """
-app.py  —  Smart Exam Hall Seating Arrangement System
-======================================================
-Single-file Flask application.
-
-Run:
-    pip install flask pandas openpyxl reportlab
-    python app.py
-
-Open: http://127.0.0.1:5000
+Smart Exam Hall Seating Arrangement System - Advanced College Edition
+Deterministic College Seating Order Generator with 1 or 2 Students Per Bench.
 """
 
 import io
+import os
 import re
+from datetime import datetime
 from string import ascii_uppercase
-from datetime import date
 
 import pandas as pd
-from flask import Flask, request, jsonify, send_file, render_template_string
+from flask import Flask, jsonify, render_template_string, request, send_file
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer,
-    Table, TableStyle, PageBreak, HRFlowable,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
 )
 
 app = Flask(__name__)
-app.secret_key = "exam-seating-2024"
+app.secret_key = os.environ.get("SECRET_KEY", "smart-exam-hall-college-key")
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SEATING ALGORITHMS
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ---------------------------------------------------------------------------
+# Helper Algorithms
+# ---------------------------------------------------------------------------
 
 def column_letter(index: int) -> str:
-    """Zero-based index → Excel-style column letter (A, B … Z, AA …)."""
+    """Converts 0-based column index to letter: 0->A, 1->B, 25->Z, 26->AA."""
     letters = ""
     index += 1
     while index > 0:
@@ -46,287 +45,342 @@ def column_letter(index: int) -> str:
 
 
 def parse_register_number(reg: str):
-    """
-    Parse a register number that may carry a department prefix.
-    Accepted: "8001", "AI8001", "CSE8001", "AI-8001", "CSE-8001"
-    Returns (prefix, numeric_str).
-    """
-    reg = reg.strip()
-    match = re.fullmatch(r'([A-Za-z]*)[-]?(\d+)', reg)
+    """Extracts non-numeric prefix and numeric digits."""
+    reg = str(reg).strip()
+    match = re.fullmatch(r"([A-Za-z0-9_\-]*?)([0-9]+)", reg)
     if not match:
-        raise ValueError(f"Invalid register number format: '{reg}'")
-    return match.group(1).upper(), match.group(2)
+        raise ValueError(f"Invalid register number format: '{reg}'. Must end with digits.")
+    return match.group(1), match.group(2), int(match.group(2))
 
 
-def generate_register_numbers(start_reg: str, end_reg: str) -> list:
-    """Generate all register numbers from start_reg to end_reg inclusive."""
-    prefix_s, num_s = parse_register_number(start_reg)
-    prefix_e, num_e = parse_register_number(end_reg)
+def generate_register_numbers(start_reg: str, end_reg: str):
+    """Generates inclusive range of register numbers."""
+    prefix_s, num_s, start_int = parse_register_number(start_reg)
+    prefix_e, num_e, end_int = parse_register_number(end_reg)
 
     if prefix_s != prefix_e:
         raise ValueError(
-            f"Start/end prefixes don't match: '{prefix_s}' vs '{prefix_e}'"
+            f"Prefixes do not match: '{prefix_s}' vs '{prefix_e}'"
         )
-
-    start_int, end_int = int(num_s), int(num_e)
     if start_int > end_int:
         raise ValueError(
-            f"Start register {start_int} is greater than end {end_int}."
+            f"Start register ({start_int}) cannot be greater than end register ({end_int})."
         )
 
     width = max(len(num_s), len(num_e))
-    dash  = "-" if ("-" in start_reg or "-" in end_reg) else ""
-
-    results = []
-    for i in range(start_int, end_int + 1):
-        numeric_part = str(i).zfill(width)
-        results.append(
-            f"{prefix_s}{dash}{numeric_part}" if prefix_s else numeric_part
-        )
-    return results
+    return [f"{prefix_s}{str(i).zfill(width)}" for i in range(start_int, end_int + 1)]
 
 
-def build_department_students(departments: list) -> dict:
-    """
-    Convert list of dept dicts [{Department, Start, End}]
-    into {dept_name: [reg_number, …]}.
-    """
-    dept_students = {}
-    for dept in departments:
-        name  = dept.get("Department", "").strip()
-        start = dept.get("Start", "").strip()
-        end   = dept.get("End",   "").strip()
-        if not (name and start and end):
+def build_department_students(departments):
+    """Builds mapping of department name -> list of register numbers with strict validation."""
+    result = {}
+    seen_names = set()
+    seen_regs = set()
+
+    for item in (departments or []):
+        if isinstance(item, dict):
+            name = str(item.get("Department", "")).strip()
+            start = str(item.get("Start", "")).strip()
+            end = str(item.get("End", "")).strip()
+        elif isinstance(item, (list, tuple)) and len(item) >= 3:
+            name, start, end = str(item[0]).strip(), str(item[1]).strip(), str(item[2]).strip()
+        else:
             continue
-        dept_students[name] = generate_register_numbers(start, end)
-    return dept_students
 
+        if not name:
+            raise ValueError("Department name cannot be empty.")
+        if not (start and end):
+            raise ValueError(f"Department '{name}' requires both start and end register numbers.")
 
-def interleave_departments(dept_students: dict) -> list:
-    """Round-robin interleave → [(dept_name, reg_number), …]."""
-    result = []
-    queues = {k: list(v) for k, v in dept_students.items()}
-    while any(queues.values()):
-        for dept in list(queues):
-            if queues[dept]:
-                result.append((dept, queues[dept].pop(0)))
+        key = name.casefold()
+        if key in seen_names:
+            raise ValueError(f"Duplicate department name detected: '{name}'.")
+        seen_names.add(key)
+
+        regs = generate_register_numbers(start, end)
+        for r in regs:
+            if r in seen_regs:
+                raise ValueError(f"Duplicate register number detected across departments: '{r}'.")
+            seen_regs.add(r)
+
+        result[name] = regs
+
     return result
 
 
-def split_halls(students: list, capacity: int) -> list:
-    """Split interleaved student list into chunks of `capacity`."""
-    return [students[i:i + capacity] for i in range(0, len(students), capacity)]
-
-
-def build_hall_layout(students: list, rows: int, cols: int, arrangement: str):
+def make_benches(dept_students, max_benches, students_per_bench=2):
     """
-    Place students into a rows×cols grid.
-    arrangement: "Vertical" | "Horizontal" | "Diamond"
-    Returns (layout_2d, seat_data_list).
+    Deterministic seating allocation:
+    - If students_per_bench == 1:
+      Every bench has 1 student (Student 2 is None).
+    - If students_per_bench == 2:
+      Primary 2 departments are paired first (benches 1..N).
+      When one runs out, subsequent departments fill remaining empty bench positions.
+      Never allow 3 students on a bench.
     """
-    layout    = [["" for _ in range(cols)] for _ in range(rows)]
-    positions = []
+    depts = list(dept_students.keys())
+    queues = {d: list(dept_students[d]) for d in depts}
+    benches = []
 
-    if arrangement == "Horizontal":
-        for r in range(rows):
-            for c in range(cols):
-                positions.append((r, c))
+    if students_per_bench == 1:
+        for d in depts:
+            while queues[d] and len(benches) < max_benches:
+                benches.append([(d, queues[d].pop(0)), None])
+        return benches
 
-    elif arrangement == "Vertical":
-        for c in range(cols):
-            for r in range(rows):
-                positions.append((r, c))
+    # 2 Students Per Bench:
+    primary = depts[:2]
+    remaining_depts = depts[2:]
 
-    else:  # Diamond
-        center_r, center_c = rows // 2, cols // 2
-        cells = []
-        for r in range(rows):
-            for c in range(cols):
-                cells.append((abs(r - center_r) + abs(c - center_c), r, c))
-        cells.sort()
-        positions = [(r, c) for _, r, c in cells]
+    while any(queues[d] for d in primary) and len(benches) < max_benches:
+        left = (primary[0], queues[primary[0]].pop(0)) if queues[primary[0]] else None
+        right = (primary[1], queues[primary[1]].pop(0)) if len(primary) > 1 and queues[primary[1]] else None
 
-    seat_data = []
-    for student, (r, c) in zip(students, positions):
-        dept, reg = student
-        cell_label = reg if any(ch.isalpha() for ch in reg) else f"{dept}-{reg}"
-        layout[r][c] = cell_label
-        seat_data.append({
-            "Seat":            f"{column_letter(c)}{r + 1}",
-            "Department":      dept,
-            "Register Number": cell_label,
+        # If one department runs out, use remaining empty bench positions for next department
+        if left is not None and right is None:
+            for d in remaining_depts:
+                if queues[d]:
+                    right = (d, queues[d].pop(0))
+                    break
+        elif left is None and right is not None:
+            for d in remaining_depts:
+                if queues[d]:
+                    left = (d, queues[d].pop(0))
+                    break
+
+        if left is not None or right is not None:
+            benches.append([left, right])
+
+    # Leftover students fill available slots or create new benches
+    leftover = []
+    for d in depts:
+        while queues[d]:
+            leftover.append((d, queues[d].pop(0)))
+
+    for st in leftover:
+        placed = False
+        for b in benches:
+            if b[0] is None:
+                b[0] = st
+                placed = True
+                break
+            elif b[1] is None:
+                b[1] = st
+                placed = True
+                break
+        if not placed and len(benches) < max_benches:
+            benches.append([st, None])
+
+    return benches
+
+
+def assign_bench_positions(benches, rows, cols, students_per_bench=2):
+    """Maps benches to row and column grid with bench group letters A, B, C..."""
+    result = []
+    for index, bench in enumerate(benches):
+        r = index % rows
+        c = index // rows
+        bench_no = index + 1
+        grp_letter = column_letter(c)
+
+        left = bench[0]
+        right = bench[1] if students_per_bench == 2 else None
+
+        def format_student(slot, st):
+            if not st:
+                return None
+            dept, reg = st
+            return {
+                "Slot": slot,
+                "Department": dept,
+                "Register Number": reg,
+                "Seat": f"{grp_letter}{r + 1}-{slot}",
+            }
+
+        result.append({
+            "Bench": bench_no,
+            "Row": r + 1,
+            "Column": c + 1,
+            "Group Letter": grp_letter,
+            "Student 1": format_student("A", left),
+            "Student 2": format_student("B", right),
         })
-
-    return layout, seat_data
-
-
-def compute_statistics(halls_data: list) -> dict:
-    """Return aggregate stats across all generated halls."""
-    total_students = sum(len(h["seat_data"]) for h in halls_data)
-    dept_counts    = {}
-    for h in halls_data:
-        for row in h["seat_data"]:
-            d = row["Department"]
-            dept_counts[d] = dept_counts.get(d, 0) + 1
-    return {
-        "total_students": total_students,
-        "total_halls":    len(halls_data),
-        "dept_counts":    dept_counts,
-    }
+    return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PDF GENERATION
-# ═══════════════════════════════════════════════════════════════════════════
-
-_NAVY      = colors.HexColor("#1B2A4A")
-_SLATE     = colors.HexColor("#3A5080")
-_BLUE      = colors.HexColor("#2563EB")
-_LIGHT_BLUE= colors.HexColor("#EFF6FF")
-_LIGHT_GREY= colors.HexColor("#F8FAFC")
-_MID_GREY  = colors.HexColor("#CBD5E1")
+def normalize_bench(bench):
+    if isinstance(bench, dict):
+        return bench
+    return {"Bench": 0, "Row": 0, "Column": 0, "Group Letter": "A", "Student 1": None, "Student 2": None}
 
 
-def _pdf_styles():
-    base = getSampleStyleSheet()
-    return {
-        "institution": ParagraphStyle(
-            "Institution", parent=base["Normal"],
-            fontName="Helvetica-Bold", fontSize=10,
-            textColor=_SLATE, alignment=TA_CENTER, spaceAfter=2,
-        ),
-        "main_title": ParagraphStyle(
-            "MainTitle", parent=base["Normal"],
-            fontName="Helvetica-Bold", fontSize=18,
-            textColor=_NAVY, alignment=TA_CENTER, spaceAfter=4,
-        ),
-        "hall_heading": ParagraphStyle(
-            "HallHeading", parent=base["Normal"],
-            fontName="Helvetica-Bold", fontSize=13,
-            textColor=_BLUE, alignment=TA_CENTER, spaceAfter=2,
-        ),
-        "meta": ParagraphStyle(
-            "Meta", parent=base["Normal"],
-            fontName="Helvetica", fontSize=9,
-            textColor=_SLATE, alignment=TA_CENTER,
-        ),
-        "section_label": ParagraphStyle(
-            "SectionLabel", parent=base["Normal"],
-            fontName="Helvetica-Bold", fontSize=10,
-            textColor=_NAVY, alignment=TA_LEFT,
-            spaceBefore=10, spaceAfter=4,
-        ),
-    }
+# ---------------------------------------------------------------------------
+# PDF Generation (Landscape A4 matching college reference style)
+# ---------------------------------------------------------------------------
 
-
-def _seat_table_style(row_count: int) -> TableStyle:
-    cmds = [
-        ("BACKGROUND",    (0, 0), (-1,  0), _NAVY),
-        ("TEXTCOLOR",     (0, 0), (-1,  0), colors.white),
-        ("FONTNAME",      (0, 0), (-1,  0), "Helvetica-Bold"),
-        ("FONTSIZE",      (0, 0), (-1,  0), 9),
-        ("ALIGN",         (0, 0), (-1,  0), "CENTER"),
-        ("BOTTOMPADDING", (0, 0), (-1,  0), 6),
-        ("TOPPADDING",    (0, 0), (-1,  0), 6),
-        ("FONTNAME",      (0, 1), (-1, -1), "Helvetica"),
-        ("FONTSIZE",      (0, 1), (-1, -1), 8),
-        ("ALIGN",         (0, 1), (-1, -1), "CENTER"),
-        ("TOPPADDING",    (0, 1), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
-        ("GRID",          (0, 0), (-1, -1), 0.4, _MID_GREY),
-        ("LINEBELOW",     (0, 0), (-1,  0), 1.2, _BLUE),
-    ]
-    for row in range(1, row_count + 1):
-        bg = _LIGHT_BLUE if row % 2 == 0 else _LIGHT_GREY
-        cmds.append(("BACKGROUND", (0, row), (-1, row), bg))
-    return TableStyle(cmds)
-
-
-def _layout_table_style() -> TableStyle:
-    return TableStyle([
-        ("BACKGROUND",    (0, 0), (-1,  0), _NAVY),
-        ("TEXTCOLOR",     (0, 0), (-1,  0), colors.white),
-        ("FONTNAME",      (0, 0), (-1,  0), "Helvetica-Bold"),
-        ("FONTSIZE",      (0, 0), (-1,  0), 8),
-        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
-        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-        ("BACKGROUND",    (0, 1), (0,  -1), _SLATE),
-        ("TEXTCOLOR",     (0, 1), (0,  -1), colors.white),
-        ("FONTNAME",      (0, 1), (0,  -1), "Helvetica-Bold"),
-        ("FONTNAME",      (1, 1), (-1, -1), "Helvetica"),
-        ("FONTSIZE",      (1, 1), (-1, -1), 7),
-        ("TOPPADDING",    (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("GRID",          (0, 0), (-1, -1), 0.4, _MID_GREY),
-        ("LINEBELOW",     (0, 0), (-1,  0), 1.2, _BLUE),
-        ("BOX",           (0, 0), (-1, -1), 1,   _SLATE),
-    ])
-
-
-def create_pdf(halls_data: list, exam_title: str = "Examination") -> bytes:
-    """Build a complete landscape-A4 PDF for all halls. Returns raw bytes."""
+def create_pdf(halls, settings):
     buffer = io.BytesIO()
-    styles = _pdf_styles()
-    today  = date.today().strftime("%d %B %Y")
-
     doc = SimpleDocTemplate(
-        buffer, pagesize=landscape(A4),
-        leftMargin=1.5*cm, rightMargin=1.5*cm,
-        topMargin=1.5*cm,  bottomMargin=1.5*cm,
-        title=f"{exam_title} – Seating Arrangement",
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=0.8 * cm,
+        rightMargin=0.8 * cm,
+        topMargin=0.8 * cm,
+        bottomMargin=0.8 * cm,
+        title=f"{settings.get('college_name', 'College')} - Seating Order",
     )
 
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("ColTitle", fontName="Helvetica-Bold", fontSize=13, alignment=TA_CENTER, leading=16)
+    sub_style = ParagraphStyle("ColSub", fontName="Helvetica-Bold", fontSize=10, alignment=TA_CENTER, leading=13)
+    order_style = ParagraphStyle("Order", fontName="Helvetica-Bold", fontSize=12, alignment=TA_CENTER, leading=15, spaceAfter=4)
+    meta_style = ParagraphStyle("Meta", fontName="Helvetica-Bold", fontSize=8.5, alignment=TA_CENTER)
+
     elements = []
+    is_single = int(settings.get("students_per_bench", 2)) == 1
 
-    for idx, hall in enumerate(halls_data):
-        label      = hall["label"]
-        seat_data  = hall["seat_data"]
-        layout     = hall["layout"]
-        col_headers= hall.get("columns", [])
+    for h_idx, hall in enumerate(halls):
+        elements.append(Paragraph(settings.get("college_name", "COLLEGE").upper(), title_style))
+        elements.append(Paragraph(settings.get("exam_title", "Examination"), sub_style))
+        if settings.get("exam_period"):
+            elements.append(Paragraph(settings.get("exam_period", ""), sub_style))
+        elements.append(Paragraph("SEATING ORDER", order_style))
 
-        # Header
-        elements.append(Paragraph("Smart Exam Hall Seating Arrangement System", styles["institution"]))
-        elements.append(Paragraph(exam_title, styles["main_title"]))
-        elements.append(HRFlowable(width="100%", thickness=1.5, color=_BLUE, spaceAfter=6))
-        elements.append(Paragraph(label, styles["hall_heading"]))
-        elements.append(Paragraph(f"Date: {today}", styles["meta"]))
-        elements.append(Spacer(1, 0.4*cm))
+        # Meta box
+        meta_table = Table(
+            [[
+                Paragraph(f"<b>Session :</b> {settings.get('session', 'FN')}", meta_style),
+                Paragraph(f"<b>Hall No :</b> {hall.get('label', 'Hall')}", meta_style),
+                Paragraph(f"<b>Exam Date :</b> {settings.get('exam_date', '')}", meta_style),
+            ]],
+            colWidths=[8.8 * cm, 8.8 * cm, 8.8 * cm],
+        )
+        meta_table.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.75, colors.black),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.black),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(meta_table)
+        elements.append(Spacer(1, 0.3 * cm))
 
-        # Seat allocation table
-        elements.append(Paragraph("Seat Allocation", styles["section_label"]))
-        if seat_data:
-            headers    = ["Seat", "Department", "Register Number"]
-            table_data = [headers] + [
-                [r["Seat"], r["Department"], r["Register Number"]]
-                for r in seat_data
-            ]
-            CHUNK = 35
-            chunks = [table_data[:1] + table_data[i:i+CHUNK]
-                      for i in range(1, len(table_data), CHUNK)]
-            for chunk in chunks:
-                t = Table(chunk, repeatRows=1, hAlign="LEFT")
-                t.setStyle(_seat_table_style(len(chunk) - 1))
-                elements.append(t)
-                elements.append(Spacer(1, 0.2*cm))
+        # Main Seating Order Table
+        benches = hall.get("benches", [])
+        cols = hall.get("cols", 5)
+        rows_count = hall.get("rows", 5)
 
-        elements.append(Spacer(1, 0.4*cm))
+        # Build side-by-side bench groups (A, B, C, D, E...)
+        header_grp = []
+        header_sub = []
+        for c in range(cols):
+            grp_name = column_letter(c)
+            # Find department names for this column group
+            grp_benches = [b for b in benches if b.get("Column") == (c + 1)]
+            d1_names = list({b["Student 1"]["Department"] for b in grp_benches if b.get("Student 1")})
+            d2_names = list({b["Student 2"]["Department"] for b in grp_benches if b.get("Student 2")})
 
-        # Hall layout grid
-        elements.append(Paragraph("Hall Layout", styles["section_label"]))
-        if layout and col_headers:
-            num_cols = len(layout[0])
-            lt_data  = [[""] + col_headers]
-            for r_idx, row in enumerate(layout):
-                lt_data.append([str(r_idx+1)] + [c if c else "—" for c in row])
+            d1_label = " / ".join(d1_names) if d1_names else "Vacant"
+            d2_label = " / ".join(d2_names) if d2_names else "Vacant"
 
-            col_w  = min((landscape(A4)[0] - 3*cm) / (num_cols + 1), 3.2*cm)
-            col_ws = [0.8*cm] + [col_w] * num_cols
+            if is_single:
+                header_grp.extend([grp_name, ""])
+                header_sub.extend(["", d1_label])
+            else:
+                header_grp.extend([grp_name, "", ""])
+                header_sub.extend(["", d1_label, d2_label])
 
-            lt = Table(lt_data, colWidths=col_ws, repeatRows=1, hAlign="LEFT")
-            lt.setStyle(_layout_table_style())
-            elements.append(lt)
+        grid_rows = [header_grp, header_sub]
 
-        if idx < len(halls_data) - 1:
+        for r in range(rows_count):
+            row_data = []
+            for c in range(cols):
+                target_bench_no = c * rows_count + (r + 1)
+                match_b = next((b for b in benches if b.get("Bench") == target_bench_no), None)
+                if match_b:
+                    s1 = match_b.get("Student 1")
+                    s2 = match_b.get("Student 2")
+                    if is_single:
+                        row_data.extend([
+                            str(match_b.get("Bench", "")),
+                            s1.get("Register Number", "") if s1 else "",
+                        ])
+                    else:
+                        row_data.extend([
+                            str(match_b.get("Bench", "")),
+                            s1.get("Register Number", "") if s1 else "",
+                            s2.get("Register Number", "") if s2 else "",
+                        ])
+                else:
+                    row_data.extend(["", ""] if is_single else ["", "", ""])
+            grid_rows.append(row_data)
+
+        # Calculate column widths
+        total_width = 26.5 * cm
+        num_cols = len(header_grp)
+        col_w = total_width / num_cols
+
+        tstyle = [
+            ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
+            ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.black),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold"),
+            ("FONTNAME", (0, 2), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]
+
+        # Add spans for group letters across their sub-columns
+        step = 2 if is_single else 3
+        for i in range(0, num_cols, step):
+            tstyle.append(("SPAN", (i, 0), (i + step - 1, 0)))
+            tstyle.append(("BACKGROUND", (i, 0), (i + step - 1, 0), colors.HexColor("#f1f5f9")))
+            tstyle.append(("BACKGROUND", (i, 1), (i + step - 1, 1), colors.HexColor("#f8fafc")))
+
+        main_table = Table(grid_rows, colWidths=[col_w] * num_cols)
+        main_table.setStyle(TableStyle(tstyle))
+        elements.append(main_table)
+        elements.append(Spacer(1, 0.4 * cm))
+
+        # Department count summary
+        dept_counts = {}
+        for b in benches:
+            for k in ("Student 1", "Student 2"):
+                st = b.get(k)
+                if st and st.get("Department"):
+                    d = st["Department"]
+                    dept_counts[d] = dept_counts.get(d, 0) + 1
+
+        summary_data = [["Department", "Count"]]
+        for d, cnt in dept_counts.items():
+            summary_data.append([d, str(cnt).zfill(2)])
+        summary_data.append(["TOTAL", str(sum(dept_counts.values())).zfill(2)])
+
+        sm_table = Table(summary_data, colWidths=[4.5 * cm, 2.0 * cm], hAlign="LEFT")
+        sm_table.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
+            ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.black),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f1f5f9")),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("ALIGN", (1, 0), (1, -1), "CENTER"),
+            ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+        ]))
+        elements.append(sm_table)
+        elements.append(Spacer(1, 0.6 * cm))
+
+        # Signatures
+        sig_table = Table(
+            [[Paragraph("<b>Controller of Examinations</b>", meta_style), Paragraph("<b>Principal</b>", meta_style)]],
+            colWidths=[12.0 * cm, 12.0 * cm],
+        )
+        elements.append(sig_table)
+
+        if h_idx < len(halls) - 1:
             elements.append(PageBreak())
 
     doc.build(elements)
@@ -334,900 +388,413 @@ def create_pdf(halls_data: list, exam_title: str = "Examination") -> bytes:
     return buffer.read()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  EXCEL GENERATION
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Excel Generation
+# ---------------------------------------------------------------------------
 
-def create_excel(halls_data: list) -> bytes:
-    """Build an .xlsx workbook (one sheet per hall). Returns raw bytes."""
+def create_excel(halls, settings):
     buffer = io.BytesIO()
+    is_single = int(settings.get("students_per_bench", 2)) == 1
+
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        for hall in halls_data:
-            label    = hall["label"][:31]
-            seat_df  = pd.DataFrame(hall["seat_data"])
-            cols     = hall.get("columns", [])
-            layout_df= pd.DataFrame(hall["layout"], columns=cols)
+        summary_rows = []
+        overall_counts = {}
 
-            seat_df.to_excel(writer, sheet_name=label, index=False, startrow=0)
-            gap = len(seat_df) + 3
-            layout_df.to_excel(writer, sheet_name=label, index=True, startrow=gap)
+        for hall in halls:
+            benches = hall.get("benches", [])
+            sheet_rows = []
 
-            ws = writer.sheets[label]
-            for col_cells in ws.columns:
-                max_len = max(
-                    (len(str(c.value)) if c.value else 0) for c in col_cells
-                )
-                ws.column_dimensions[col_cells[0].column_letter].width = max_len + 4
+            for b in benches:
+                s1 = b.get("Student 1")
+                s2 = b.get("Student 2")
+
+                if is_single:
+                    sheet_rows.append({
+                        "Bench No": b.get("Bench"),
+                        "Group": b.get("Group Letter"),
+                        "Row": b.get("Row"),
+                        "Column": b.get("Column"),
+                        "Department": s1.get("Department", "") if s1 else "",
+                        "Register Number": s1.get("Register Number", "") if s1 else "",
+                    })
+                else:
+                    sheet_rows.append({
+                        "Bench No": b.get("Bench"),
+                        "Group": b.get("Group Letter"),
+                        "Row": b.get("Row"),
+                        "Column": b.get("Column"),
+                        "Student 1 Department": s1.get("Department", "") if s1 else "",
+                        "Student 1 Register No": s1.get("Register Number", "") if s1 else "",
+                        "Student 2 Department": s2.get("Department", "") if s2 else "",
+                        "Student 2 Register No": s2.get("Register Number", "") if s2 else "",
+                    })
+
+                for s in (s1, s2):
+                    if s and s.get("Department"):
+                        d = s["Department"]
+                        overall_counts[d] = overall_counts.get(d, 0) + 1
+
+            sheet_name = re.sub(r"[\[\]:*?/\\]", "_", hall.get("label", "Hall"))[:31]
+            pd.DataFrame(sheet_rows).to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # Department Summary Sheet
+        summary_records = [{"Department": d, "Student Count": c} for d, c in overall_counts.items()]
+        summary_records.append({"Department": "TOTAL", "Student Count": sum(overall_counts.values())})
+        pd.DataFrame(summary_records).to_excel(writer, sheet_name="Department Summary", index=False)
 
     buffer.seek(0)
     return buffer.read()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  HTML TEMPLATE  (Bootstrap 5 via CDN, all CSS + JS inline)
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# HTML Web Interface
+# ---------------------------------------------------------------------------
 
-HTML_TEMPLATE = r"""<!DOCTYPE html>
+HTML_TEMPLATE = r"""
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Smart Exam Hall Seating System</title>
-<link rel="stylesheet"
-  href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"/>
-<link rel="stylesheet"
-  href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"/>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
-  rel="stylesheet"/>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Exam Hall Seating Arrangement System</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
-/* ── Tokens ─────────────────────────────────────────────────────── */
-:root{
-  --navy:#1B2A4A; --navy-light:#243660;
-  --blue:#2563EB; --blue-light:#3B82F6; --blue-pale:#EFF6FF;
-  --slate:#3A5080;
-  --surface:#F8FAFC; --surface-2:#F1F5F9;
-  --border:#E2E8F0; --border-dark:#CBD5E1;
-  --text:#0F172A; --text-muted:#64748B;
-  --success:#16A34A; --danger:#DC2626; --white:#FFFFFF;
-  --radius-sm:6px; --radius:12px; --radius-lg:18px;
-  --shadow-sm:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);
-  --shadow:0 4px 16px rgba(0,0,0,.08),0 2px 4px rgba(0,0,0,.04);
-  --font-body:'Inter',system-ui,sans-serif;
-  --font-mono:'JetBrains Mono','Courier New',monospace;
-}
-*,*::before,*::after{box-sizing:border-box;}
-html{scroll-behavior:smooth;}
-body{font-family:var(--font-body);background:var(--surface);color:var(--text);
-  line-height:1.6;-webkit-font-smoothing:antialiased;}
-code{font-family:var(--font-mono);font-size:.85em;background:var(--blue-pale);
-  color:var(--blue);padding:2px 6px;border-radius:var(--radius-sm);}
-
-/* ── Navbar ─────────────────────────────────────────────────────── */
-#mainNav{background:var(--navy);border-bottom:1px solid rgba(255,255,255,.06);
-  box-shadow:0 2px 16px rgba(0,0,0,.25);height:60px;z-index:1030;}
-.brand-icon{display:flex;align-items:center;justify-content:center;
-  width:34px;height:34px;background:var(--blue);border-radius:8px;font-size:1.1rem;}
-.brand-text{font-size:1.15rem;font-weight:700;letter-spacing:-.3px;color:var(--white);}
-.brand-accent{color:var(--blue-light);}
-.bg-accent-badge{background:rgba(37,99,235,.25)!important;
-  border:1px solid rgba(37,99,235,.4);font-size:.78rem;letter-spacing:.3px;}
-
-/* ── Hero ───────────────────────────────────────────────────────── */
-.hero-section{
-  background:linear-gradient(135deg,var(--navy) 0%,var(--navy-light) 60%,#1e3a6e 100%);
-  color:var(--white);padding:4rem 1rem 3.5rem;position:relative;overflow:hidden;}
-.hero-section::after{content:'';position:absolute;inset:0;
-  background:radial-gradient(ellipse 60% 80% at 80% 50%,rgba(37,99,235,.18),transparent);
-  pointer-events:none;}
-.hero-eyebrow{font-size:.8rem;font-weight:600;letter-spacing:1.5px;
-  text-transform:uppercase;color:var(--blue-light);margin-bottom:.75rem;}
-.hero-title{font-size:clamp(2rem,5vw,3rem);font-weight:700;line-height:1.15;
-  letter-spacing:-.5px;margin-bottom:1rem;}
-.hero-subtitle{font-size:1.05rem;color:rgba(255,255,255,.72);
-  max-width:540px;line-height:1.7;}
-.hero-stat-cluster{display:flex;flex-direction:column;gap:.6rem;align-items:flex-end;}
-.stat-chip{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);
-  border-radius:50px;padding:.4rem 1rem;font-size:.82rem;font-weight:500;
-  color:rgba(255,255,255,.85);backdrop-filter:blur(8px);}
-.btn-primary-brand{background:var(--blue);border:none;color:var(--white);font-weight:600;
-  border-radius:var(--radius);padding:.65rem 1.5rem;
-  transition:background .2s,transform .15s,box-shadow .2s;}
-.btn-primary-brand:hover{background:var(--blue-light);color:var(--white);
-  transform:translateY(-1px);box-shadow:0 6px 20px rgba(37,99,235,.4);}
-
-/* ── Section Cards ──────────────────────────────────────────────── */
-.section-card{background:var(--white);border:1px solid var(--border);
-  border-radius:var(--radius-lg);box-shadow:var(--shadow-sm);overflow:hidden;
-  transition:box-shadow .2s;}
-.section-card:hover{box-shadow:var(--shadow);}
-.section-header{display:flex;align-items:flex-start;gap:1rem;
-  padding:1.4rem 1.75rem;
-  background:linear-gradient(to right,var(--blue-pale),var(--white));
-  border-bottom:1px solid var(--border);}
-.section-icon{display:flex;align-items:center;justify-content:center;
-  width:42px;height:42px;min-width:42px;background:var(--blue);color:var(--white);
-  border-radius:var(--radius);font-size:1.2rem;}
-.section-title{font-size:1.1rem;font-weight:700;color:var(--navy);
-  margin:0 0 .15rem;letter-spacing:-.2px;}
-.section-subtitle{font-size:.82rem;color:var(--text-muted);margin:0;}
-.section-body{padding:1.75rem;}
-
-/* ── Form controls ──────────────────────────────────────────────── */
-.form-label{font-size:.875rem;color:var(--navy);margin-bottom:.4rem;}
-.form-control,.form-select{border:1.5px solid var(--border-dark);
-  border-radius:var(--radius);font-size:.92rem;color:var(--text);background:var(--white);
-  transition:border-color .18s,box-shadow .18s;}
-.form-control:focus,.form-select:focus{border-color:var(--blue);
-  box-shadow:0 0 0 3px rgba(37,99,235,.15);outline:none;}
-.text-accent{color:var(--blue)!important;}
-.capacity-display{display:flex;align-items:center;justify-content:center;
-  height:50px;background:linear-gradient(135deg,var(--navy),var(--slate));
-  color:var(--white);font-size:1rem;font-weight:700;border-radius:var(--radius);
-  letter-spacing:.5px;}
-
-/* ── Arrangement Cards ──────────────────────────────────────────── */
-.arrangement-card{display:flex;flex-direction:column;align-items:center;
-  text-align:center;padding:1.5rem 1rem;border:2px solid var(--border);
-  border-radius:var(--radius);background:var(--surface);cursor:pointer;
-  transition:border-color .2s,background .2s,box-shadow .2s,transform .15s;
-  user-select:none;}
-.arrangement-card:hover{border-color:var(--blue-light);background:var(--blue-pale);
-  transform:translateY(-2px);box-shadow:var(--shadow-sm);}
-.btn-check:checked+.arrangement-card{border-color:var(--blue);
-  background:var(--blue-pale);box-shadow:0 0 0 3px rgba(37,99,235,.2);}
-.arr-icon{font-size:1.8rem;color:var(--blue);margin-bottom:.6rem;}
-.arr-name{font-size:.95rem;font-weight:700;color:var(--navy);margin-bottom:.25rem;}
-.arr-desc{font-size:.78rem;color:var(--text-muted);line-height:1.4;}
-
-/* ── Department Rows ────────────────────────────────────────────── */
-.dept-row{display:grid;grid-template-columns:1fr 1fr 1fr auto;
-  gap:.75rem;align-items:end;padding:1rem 1.25rem;
-  background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);margin-bottom:.75rem;transition:box-shadow .2s;}
-.dept-row:hover{box-shadow:var(--shadow-sm);}
-@media(max-width:767px){
-  .dept-row{grid-template-columns:1fr 1fr;gap:.6rem;}
-  .dept-row .dept-remove-col{grid-column:1/-1;justify-self:end;}
-}
-.dept-row-number{font-size:.7rem;font-weight:700;color:var(--white);
-  background:var(--blue);border-radius:50%;width:22px;height:22px;
-  display:inline-flex;align-items:center;justify-content:center;margin-bottom:.4rem;}
-.btn-remove-dept{display:flex;align-items:center;justify-content:center;
-  width:38px;height:38px;border:1.5px solid #FCA5A5;background:#FEF2F2;
-  color:var(--danger);border-radius:var(--radius);cursor:pointer;font-size:1rem;
-  transition:background .18s,border-color .18s;}
-.btn-remove-dept:hover{background:#FEE2E2;border-color:var(--danger);}
-.btn-add-dept{display:inline-flex;align-items:center;background:var(--blue-pale);
-  color:var(--blue);border:1.5px solid rgba(37,99,235,.25);border-radius:var(--radius);
-  padding:.45rem 1rem;font-size:.85rem;font-weight:600;cursor:pointer;white-space:nowrap;
-  transition:background .18s,border-color .18s;}
-.btn-add-dept:hover{background:#DBEAFE;border-color:var(--blue);}
-.dept-empty-state{text-align:center;padding:2.5rem 1rem;}
-
-/* ── Generate Button ────────────────────────────────────────────── */
-.btn-generate{background:linear-gradient(135deg,var(--blue),#1D4ED8);color:var(--white);
-  border:none;border-radius:50px;padding:1rem 3rem;font-size:1.05rem;font-weight:700;
-  letter-spacing:.3px;box-shadow:0 6px 24px rgba(37,99,235,.45);
-  transition:transform .18s,box-shadow .18s,background .18s;}
-.btn-generate:hover{transform:translateY(-2px);
-  box-shadow:0 10px 32px rgba(37,99,235,.55);
-  background:linear-gradient(135deg,var(--blue-light),var(--blue));color:var(--white);}
-.btn-generate:active{transform:translateY(0);}
-.btn-generate:disabled{opacity:.65;transform:none;cursor:not-allowed;}
-
-/* ── Stats Bar ──────────────────────────────────────────────────── */
-.stats-bar{display:flex;align-items:center;justify-content:center;
-  background:var(--white);border:1px solid var(--border);border-radius:var(--radius-lg);
-  box-shadow:var(--shadow-sm);padding:1.25rem 2rem;flex-wrap:wrap;gap:0;}
-.stat-item{display:flex;flex-direction:column;align-items:center;padding:0 2rem;}
-.stat-value{font-size:1.8rem;font-weight:800;color:var(--blue);
-  line-height:1;letter-spacing:-1px;}
-.stat-label{font-size:.75rem;font-weight:500;color:var(--text-muted);
-  text-transform:uppercase;letter-spacing:.8px;margin-top:.25rem;}
-.stat-divider{width:1px;height:40px;background:var(--border);}
-
-/* ── Global Action Bar ──────────────────────────────────────────── */
-.global-action-bar{display:flex;align-items:center;justify-content:space-between;
-  flex-wrap:wrap;gap:.75rem;background:#F0FDF4;border:1px solid #BBF7D0;
-  border-radius:var(--radius);padding:1rem 1.5rem;}
-.global-action-label{font-weight:600;font-size:.92rem;color:#15803D;}
-.btn-dl-pdf{display:inline-flex;align-items:center;background:#DC2626;
-  color:var(--white);border:none;border-radius:var(--radius);
-  padding:.5rem 1.1rem;font-size:.85rem;font-weight:600;
-  transition:background .18s,transform .15s;}
-.btn-dl-pdf:hover{background:#B91C1C;color:var(--white);transform:translateY(-1px);}
-.btn-dl-excel{display:inline-flex;align-items:center;background:#16A34A;
-  color:var(--white);border:none;border-radius:var(--radius);
-  padding:.5rem 1.1rem;font-size:.85rem;font-weight:600;
-  transition:background .18s,transform .15s;}
-.btn-dl-excel:hover{background:#15803D;color:var(--white);transform:translateY(-1px);}
-.btn-print-top{display:inline-flex;align-items:center;background:var(--slate);
-  color:var(--white);border:none;border-radius:var(--radius);
-  padding:.5rem 1.1rem;font-size:.85rem;font-weight:600;
-  transition:background .18s,transform .15s;}
-.btn-print-top:hover{background:var(--navy);color:var(--white);transform:translateY(-1px);}
-
-/* ── Hall Result Cards ──────────────────────────────────────────── */
-.hall-card{background:var(--white);border:1px solid var(--border);
-  border-radius:var(--radius-lg);box-shadow:var(--shadow-sm);
-  margin-bottom:2rem;overflow:hidden;}
-.hall-card-header{display:flex;align-items:center;justify-content:space-between;
-  flex-wrap:wrap;gap:.75rem;padding:1.1rem 1.5rem;
-  background:linear-gradient(to right,var(--navy),var(--navy-light));color:var(--white);}
-.hall-card-title{font-size:1.05rem;font-weight:700;margin:0;
-  display:flex;align-items:center;gap:.5rem;}
-.hall-badge{font-size:.72rem;background:rgba(255,255,255,.15);
-  border:1px solid rgba(255,255,255,.2);border-radius:50px;
-  padding:.2rem .75rem;font-weight:500;}
-.hall-card-body{padding:1.5rem;}
-
-/* ── Tables ─────────────────────────────────────────────────────── */
-.result-table-wrap{overflow-x:auto;border-radius:var(--radius);
-  border:1px solid var(--border);margin-bottom:1.5rem;}
-.result-table{width:100%;border-collapse:collapse;font-size:.82rem;
-  font-family:var(--font-mono);}
-.result-table thead th{background:var(--navy);color:var(--white);font-weight:600;
-  padding:.65rem 1rem;text-align:center;white-space:nowrap;
-  font-family:var(--font-body);font-size:.78rem;letter-spacing:.4px;text-transform:uppercase;}
-.result-table thead th:first-child{text-align:left;}
-.result-table tbody tr:nth-child(even){background:var(--blue-pale);}
-.result-table tbody tr:nth-child(odd){background:var(--white);}
-.result-table tbody tr:hover{background:#DBEAFE;}
-.result-table tbody td{padding:.55rem 1rem;text-align:center;
-  border-bottom:1px solid var(--border);color:var(--text);}
-.result-table tbody td:first-child{text-align:left;}
-
-/* ── Layout Grid ────────────────────────────────────────────────── */
-.layout-grid-wrap{overflow-x:auto;border-radius:var(--radius);
-  border:1px solid var(--border);}
-.layout-table{width:100%;border-collapse:collapse;font-size:.75rem;
-  font-family:var(--font-mono);}
-.layout-table th{background:var(--navy);color:var(--white);
-  font-family:var(--font-body);font-weight:700;font-size:.72rem;
-  text-align:center;padding:.5rem .6rem;letter-spacing:.5px;min-width:80px;}
-.layout-table th.row-header{background:var(--slate);min-width:32px;}
-.layout-table tbody tr:nth-child(even) td{background:var(--blue-pale);}
-.layout-table tbody tr:nth-child(odd) td{background:var(--white);}
-.layout-table td{padding:.45rem .5rem;text-align:center;border:1px solid var(--border);
-  white-space:nowrap;transition:background .15s,transform .15s;color:var(--navy);}
-/* Signature: glowing seat-hover — maps directly to the core product output */
-.layout-table td.occupied:hover{background:#BFDBFE!important;transform:scale(1.04);
-  z-index:2;position:relative;border-color:var(--blue);
-  box-shadow:0 2px 8px rgba(37,99,235,.25);cursor:default;}
-.layout-table td.empty{color:#CBD5E1;font-style:italic;}
-.layout-table td.row-label{background:var(--slate)!important;color:var(--white);
-  font-family:var(--font-body);font-weight:700;font-size:.72rem;}
-
-/* ── Result section labels ──────────────────────────────────────── */
-.result-section-label{display:flex;align-items:center;gap:.5rem;font-size:.85rem;
-  font-weight:700;color:var(--navy);margin-bottom:.75rem;
-  text-transform:uppercase;letter-spacing:.6px;}
-.result-section-label::after{content:'';flex:1;height:1px;background:var(--border);}
-
-/* ── Alerts ─────────────────────────────────────────────────────── */
-.alert-custom{border-radius:var(--radius);border:none;font-weight:500;
-  font-size:.9rem;padding:1rem 1.25rem;}
-
-/* ── Footer ─────────────────────────────────────────────────────── */
-.site-footer{background:var(--navy);color:rgba(255,255,255,.7);
-  font-size:.85rem;border-top:1px solid rgba(255,255,255,.06);}
-
-/* ── Print ──────────────────────────────────────────────────────── */
-@media print{
-  #mainNav,.hero-section,#formSection,.global-action-bar,
-  .stats-bar,.btn-dl-pdf,.btn-dl-excel,.btn-print-top,
-  .hall-card-header .btn,.site-footer{display:none!important;}
-  body{background:white;}
-  .hall-card{break-inside:avoid;box-shadow:none;border:1px solid #ccc;margin-bottom:1.5rem;}
-  .hall-card-header{background:#1B2A4A!important;-webkit-print-color-adjust:exact;}
-}
-
-/* ── Responsive ─────────────────────────────────────────────────── */
-@media(max-width:576px){
-  .stats-bar{flex-direction:column;gap:1rem;}
-  .stat-divider{width:80%;height:1px;}
-  .stat-item{padding:0;}
-  .section-header{flex-direction:column;}
-  .btn-add-dept{width:100%;justify-content:center;margin-top:.5rem;}
+body { background: #f8fafc; color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+.hero { background: #0f172a; color: #fff; padding: 2.5rem 0; border-bottom: 3px solid #3b82f6; }
+.cardx { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; box-shadow: 0 4px 20px rgba(0,0,0,0.03); }
+.sec-title { font-weight: 700; font-size: 1.1rem; }
+.badge-bench { cursor: pointer; padding: 8px 18px; border-radius: 8px; font-weight: 600; border: 1px solid #cbd5e1; }
+.badge-bench.active { background: #2563eb; color: #fff; border-color: #2563eb; }
+.dept-row { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px; margin-bottom: 10px; }
+.sheet-preview { background: #fff; border: 2px solid #000; padding: 24px; min-width: 800px; font-family: Arial, sans-serif; }
+.sheet-table { border: 1px solid #000; width: 100%; text-align: center; border-collapse: collapse; font-size: 11px; }
+.sheet-table th, .sheet-table td { border: 1px solid #000; padding: 4px 6px; }
+@media print {
+  body { background: #fff; }
+  .no-print { display: none !important; }
+  .sheet-preview { border: none !important; padding: 0 !important; min-width: 100% !important; }
 }
 </style>
 </head>
 <body>
-
-<!-- NAVBAR -->
-<nav class="navbar navbar-expand-lg navbar-dark sticky-top" id="mainNav">
-  <div class="container-fluid px-4">
-    <a class="navbar-brand d-flex align-items-center gap-2" href="/">
-      <span class="brand-icon"><i class="bi bi-mortarboard-fill"></i></span>
-      <span class="brand-text">ExamSeat <span class="brand-accent">Pro</span></span>
-    </a>
-    <div class="ms-auto d-flex align-items-center gap-3">
-      <span class="badge bg-accent-badge text-white px-3 py-2">
-        <i class="bi bi-shield-check me-1"></i>Smart Seating System
-      </span>
-    </div>
+<div class="hero no-print mb-4">
+  <div class="container">
+    <h2 class="fw-bold mb-1">Smart Exam Hall Seating Arrangement System</h2>
+    <div class="text-secondary small">Deterministic College Seating Order Generator · Reference-image layout</div>
   </div>
-</nav>
+</div>
 
-<!-- HERO -->
-<header class="hero-section">
-  <div class="container py-3">
-    <div class="row align-items-center">
-      <div class="col-lg-8">
-        <p class="hero-eyebrow"><i class="bi bi-grid-3x3-gap-fill me-2"></i>Automated Hall Management</p>
-        <h1 class="hero-title">Smart Exam Hall<br>Seating Arrangement</h1>
-        <p class="hero-subtitle">
-          Generate professional, conflict-free exam seating plans instantly.
-          Supports unlimited departments, flexible layouts, and PDF + Excel export.
-        </p>
-        <div class="d-flex flex-wrap gap-3 mt-4">
-          <a href="#formSection" class="btn btn-primary-brand btn-lg">
-            <i class="bi bi-pencil-square me-2"></i>Start Configuring
-          </a>
-        </div>
+<div class="container pb-5">
+  <div id="alertBox" class="no-print"></div>
+
+  <form id="seatingForm" class="cardx p-4 mb-4 no-print">
+    <!-- Section 1 -->
+    <h5 class="sec-title mb-3">1. Examination Details</h5>
+    <div class="row g-3">
+      <div class="col-md-6">
+        <label class="form-label small fw-semibold">College / Institution Name</label>
+        <input class="form-control" name="college_name" value="INDRA GANESAN COLLEGE OF ENGINEERING">
       </div>
-      <div class="col-lg-4 d-none d-lg-flex justify-content-end">
-        <div class="hero-stat-cluster">
-          <div class="stat-chip"><i class="bi bi-buildings me-1"></i>Multi-Hall</div>
-          <div class="stat-chip"><i class="bi bi-diagram-3 me-1"></i>Round-Robin</div>
-          <div class="stat-chip"><i class="bi bi-file-earmark-pdf me-1"></i>PDF Export</div>
-          <div class="stat-chip"><i class="bi bi-file-earmark-excel me-1"></i>Excel Export</div>
-        </div>
+      <div class="col-md-6">
+        <label class="form-label small fw-semibold">Examination Title</label>
+        <input class="form-control" name="exam_title" value="Continuous Internal Assessment - I">
       </div>
-    </div>
-  </div>
-</header>
-
-<!-- MAIN -->
-<main class="container-xl py-5 px-3 px-md-4" id="formSection">
-
-  <div id="alertPlaceholder"></div>
-
-  <form id="seatingForm" novalidate>
-
-    <!-- HALL DETAILS -->
-    <div class="section-card mb-4">
-      <div class="section-header">
-        <span class="section-icon"><i class="bi bi-building"></i></span>
-        <div>
-          <h2 class="section-title">Hall Details</h2>
-          <p class="section-subtitle">Configure the exam hall dimensions and capacity</p>
-        </div>
+      <div class="col-md-6">
+        <label class="form-label small fw-semibold">Exam Period</label>
+        <input class="form-control" name="exam_period" value="EXAMINATIONS - NOV/DEC - 2026">
       </div>
-      <div class="section-body">
-        <div class="row g-4">
-
-          <div class="col-md-6">
-            <label class="form-label fw-semibold" for="exam_title">
-              <i class="bi bi-journal-text me-1 text-accent"></i>Examination Title
-            </label>
-            <input type="text" class="form-control form-control-lg" id="exam_title"
-                   name="exam_title" value="End Semester Examination"
-                   placeholder="e.g. End Semester Examination"/>
-            <div class="form-text">Appears in the PDF header.</div>
-          </div>
-
-          <div class="col-md-6">
-            <label class="form-label fw-semibold" for="hall_name">
-              <i class="bi bi-building me-1 text-accent"></i>Hall Name / Prefix
-            </label>
-            <input type="text" class="form-control form-control-lg" id="hall_name"
-                   name="hall_name" value="Hall"
-                   placeholder="e.g. Main Hall, Lab Block" required/>
-            <div class="invalid-feedback">Hall name is required.</div>
-          </div>
-
-          <div class="col-sm-6 col-lg-3">
-            <label class="form-label fw-semibold" for="students_per_hall">
-              <i class="bi bi-people me-1 text-accent"></i>Students Per Hall
-            </label>
-            <input type="number" class="form-control form-control-lg" id="students_per_hall"
-                   name="students_per_hall" value="30" min="1" required/>
-            <div class="invalid-feedback">Must be at least 1.</div>
-          </div>
-
-          <div class="col-sm-6 col-lg-3">
-            <label class="form-label fw-semibold" for="number_of_rows">
-              <i class="bi bi-layout-three-columns me-1 text-accent"></i>Number of Rows
-            </label>
-            <input type="number" class="form-control form-control-lg" id="number_of_rows"
-                   name="number_of_rows" value="6" min="1" required/>
-            <div class="invalid-feedback">Must be at least 1.</div>
-          </div>
-
-          <div class="col-sm-6 col-lg-3">
-            <label class="form-label fw-semibold" for="number_of_columns">
-              <i class="bi bi-layout-three-columns me-1 text-accent"></i>Number of Columns
-            </label>
-            <input type="number" class="form-control form-control-lg" id="number_of_columns"
-                   name="number_of_columns" value="5" min="1" required/>
-            <div class="invalid-feedback">Must be at least 1.</div>
-          </div>
-
-          <div class="col-sm-6 col-lg-3">
-            <label class="form-label fw-semibold">
-              <i class="bi bi-calculator me-1 text-accent"></i>Total Capacity
-            </label>
-            <div class="capacity-display" id="capacityDisplay">30 seats</div>
-          </div>
-
-        </div>
+      <div class="col-md-3">
+        <label class="form-label small fw-semibold">Session</label>
+        <select class="form-select" name="session">
+          <option value="FN" selected>FN (Forenoon)</option>
+          <option value="AN">AN (Afternoon)</option>
+        </select>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small fw-semibold">Exam Date</label>
+        <input type="date" class="form-control" name="exam_date" value="2026-11-20">
       </div>
     </div>
 
-    <!-- ARRANGEMENT -->
-    <div class="section-card mb-4">
-      <div class="section-header">
-        <span class="section-icon"><i class="bi bi-grid-3x3"></i></span>
-        <div>
-          <h2 class="section-title">Arrangement Type</h2>
-          <p class="section-subtitle">Choose how students are assigned to seats</p>
-        </div>
+    <hr class="my-4">
+
+    <!-- Section 2: Students Per Bench -->
+    <h5 class="sec-title mb-2">2. Key Feature: Students Per Bench</h5>
+    <p class="text-muted small">Select whether each bench holds 1 student or 2 students. Never allows 3.</p>
+    
+    <div class="d-flex gap-2 mb-3">
+      <div id="benchOpt1" class="badge-bench" onclick="setBenchCount(1)">1 Student per Bench</div>
+      <div id="benchOpt2" class="badge-bench active" onclick="setBenchCount(2)">2 Students per Bench</div>
+    </div>
+    <input type="hidden" name="students_per_bench" id="students_per_bench" value="2">
+
+    <!-- Hall config -->
+    <div class="row g-3 mt-1">
+      <div class="col-md-3">
+        <label class="form-label small fw-semibold">Hall Name / Prefix</label>
+        <input class="form-control" name="hall_name" value="LB-6">
       </div>
-      <div class="section-body">
-        <div class="row g-3">
-          <div class="col-md-4">
-            <input type="radio" class="btn-check" name="arrangement"
-                   id="arr_vertical" value="Vertical" checked/>
-            <label class="arrangement-card w-100" for="arr_vertical">
-              <div class="arr-icon"><i class="bi bi-arrow-down-up"></i></div>
-              <div class="arr-name">Vertical</div>
-              <div class="arr-desc">Fill columns top-to-bottom, left-to-right</div>
-            </label>
-          </div>
-          <div class="col-md-4">
-            <input type="radio" class="btn-check" name="arrangement"
-                   id="arr_horizontal" value="Horizontal"/>
-            <label class="arrangement-card w-100" for="arr_horizontal">
-              <div class="arr-icon"><i class="bi bi-arrow-left-right"></i></div>
-              <div class="arr-name">Horizontal</div>
-              <div class="arr-desc">Fill rows left-to-right, top-to-bottom</div>
-            </label>
-          </div>
-          <div class="col-md-4">
-            <input type="radio" class="btn-check" name="arrangement"
-                   id="arr_diamond" value="Diamond"/>
-            <label class="arrangement-card w-100" for="arr_diamond">
-              <div class="arr-icon"><i class="bi bi-diamond"></i></div>
-              <div class="arr-name">Diamond</div>
-              <div class="arr-desc">Fill from centre outward in a diamond pattern</div>
-            </label>
-          </div>
-        </div>
+      <div class="col-md-3">
+        <label class="form-label small fw-semibold">Students Per Hall</label>
+        <input type="number" class="form-control" name="students_per_hall" id="students_per_hall" value="50">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small fw-semibold">Number of Rows</label>
+        <input type="number" class="form-control" name="rows" id="rows" value="5" min="1">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small fw-semibold">Benches per Row (Columns)</label>
+        <input type="number" class="form-control" name="cols" id="cols" value="5" min="1">
       </div>
     </div>
 
-    <!-- DEPARTMENTS -->
-    <div class="section-card mb-4">
-      <div class="section-header">
-        <span class="section-icon"><i class="bi bi-person-badge"></i></span>
-        <div>
-          <h2 class="section-title">Department Details</h2>
-          <p class="section-subtitle">
-            Add one or more departments. Register numbers support formats like
-            <code>8001</code>, <code>AI8001</code>, <code>CSE-8001</code>.
-          </p>
-        </div>
-        <button type="button" class="btn-add-dept ms-auto" id="addDeptBtn">
-          <i class="bi bi-plus-circle me-2"></i>Add Department
-        </button>
+    <div class="alert alert-primary mt-3 py-2 small">
+      Hall Capacity: <strong id="capVal">50</strong> students (<span id="benchVal">25</span> benches × <span id="mulVal">2</span> students).
+    </div>
+
+    <hr class="my-4">
+
+    <!-- Section 3: Departments -->
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <div>
+        <h5 class="sec-title mb-0">3. Department & Register Number Ranges</h5>
+        <div class="text-muted small">Provide start and end numbers. System generates sequential registers.</div>
       </div>
-      <div class="section-body">
-        <div id="departmentList"></div>
-        <div class="dept-empty-state" id="deptEmptyState" style="display:none">
-          <i class="bi bi-inbox display-6 text-muted"></i>
-          <p class="mt-2 text-muted">No departments added yet.</p>
-        </div>
+      <div class="d-flex gap-2">
+        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="loadSampleTest()">Load Test Case (50 Students)</button>
+        <button type="button" class="btn btn-sm btn-primary" onclick="addDeptRow()">+ Add Department</button>
       </div>
     </div>
 
-    <!-- GENERATE -->
-    <div class="d-flex justify-content-center mt-2 mb-5">
-      <button type="submit" class="btn btn-generate" id="generateBtn">
-        <span class="btn-generate-inner">
-          <i class="bi bi-lightning-charge-fill me-2"></i>Generate Seating Arrangement
-        </span>
-        <span class="btn-spinner d-none">
-          <span class="spinner-border spinner-border-sm me-2"></span>Generating…
-        </span>
-      </button>
-    </div>
+    <div id="deptContainer" class="mt-3"></div>
 
+    <button type="submit" class="btn btn-primary btn-lg w-100 mt-4 fw-bold">Generate Seating Order</button>
   </form>
 
-  <!-- RESULTS -->
-  <section id="resultsSection" style="display:none">
-
-    <!-- Stats -->
-    <div class="stats-bar mb-4">
-      <div class="stat-item">
-        <span class="stat-value" id="statTotalStudents">—</span>
-        <span class="stat-label">Total Students</span>
+  <!-- Results View -->
+  <div id="resultsWrapper" class="d-none">
+    <div class="cardx p-3 mb-4 no-print d-flex justify-content-between align-items-center flex-wrap gap-2">
+      <div>
+        <h6 class="fw-bold mb-0">Seating Plan Generated Successfully</h6>
+        <div class="small text-muted" id="statsText"></div>
       </div>
-      <div class="stat-divider"></div>
-      <div class="stat-item">
-        <span class="stat-value" id="statTotalHalls">—</span>
-        <span class="stat-label">Halls Generated</span>
-      </div>
-      <div class="stat-divider"></div>
-      <div class="stat-item">
-        <span class="stat-value" id="statDepts">—</span>
-        <span class="stat-label">Departments</span>
+      <div class="d-flex gap-2">
+        <button class="btn btn-sm btn-primary" onclick="downloadFile('pdf')">Download PDF</button>
+        <button class="btn btn-sm btn-success" onclick="downloadFile('excel')">Download Excel</button>
+        <button class="btn btn-sm btn-dark" onclick="window.print()">Print</button>
       </div>
     </div>
 
-    <!-- Global downloads -->
-    <div class="global-action-bar mb-4">
-      <span class="global-action-label">
-        <i class="bi bi-check-circle-fill text-success me-2"></i>
-        Seating arrangement generated successfully
-      </span>
-      <div class="d-flex gap-2 flex-wrap">
-        <button class="btn-dl-pdf" id="globalPdfBtn">
-          <i class="bi bi-file-earmark-pdf me-2"></i>Download All PDF
-        </button>
-        <button class="btn-dl-excel" id="globalExcelBtn">
-          <i class="bi bi-file-earmark-excel me-2"></i>Download All Excel
-        </button>
-        <button class="btn-print-top" onclick="window.print()">
-          <i class="bi bi-printer me-2"></i>Print
-        </button>
-      </div>
-    </div>
-
-    <!-- Hall cards -->
-    <div id="hallResults"></div>
-
-  </section>
-
-</main>
-
-<!-- FOOTER -->
-<footer class="site-footer mt-5">
-  <div class="container text-center py-4">
-    <p class="mb-1 fw-semibold">Smart Exam Hall Seating Arrangement System</p>
-    <p class="text-muted small mb-0">
-      Automated seating plans &mdash; round-robin distribution &amp; multi-format export.
-    </p>
+    <div id="sheetContainer" class="overflow-auto mb-4"></div>
   </div>
-</footer>
+</div>
 
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-"use strict";
+let curHalls = [];
+let curSettings = {};
 
-/* ── State ──────────────────────────────────────────────────────── */
-let generatedHalls = [];
-let lastExamTitle  = "";
-let deptCounter    = 0;
+function setBenchCount(val) {
+  document.getElementById("students_per_bench").value = val;
+  document.getElementById("benchOpt1").classList.toggle("active", val === 1);
+  document.getElementById("benchOpt2").classList.toggle("active", val === 2);
+  updateCap();
+}
 
-/* ── DOM refs (resolved after DOMContentLoaded) ─────────────────── */
-let departmentList, deptEmptyState, alertPlaceholder,
-    seatingForm, generateBtn, resultsSection, hallResults,
-    statTotalStudents, statTotalHalls, statDepts,
-    globalPdfBtn, globalExcelBtn,
-    rowsInput, colsInput, capacityDisplay;
+function updateCap() {
+  const r = +document.getElementById("rows").value || 1;
+  const c = +document.getElementById("cols").value || 1;
+  const b = +document.getElementById("students_per_bench").value || 2;
+  const totalBenches = r * c;
+  document.getElementById("benchVal").textContent = totalBenches;
+  document.getElementById("mulVal").textContent = b;
+  document.getElementById("capVal").textContent = totalBenches * b;
+}
 
-/* ── Department row factory ─────────────────────────────────────── */
-function createDeptRow() {
-  deptCounter++;
-  const idx  = deptCounter;
-  const wrap = document.createElement("div");
-  wrap.className  = "dept-row";
-  wrap.dataset.id = idx;
-  wrap.innerHTML  = `
-    <div>
-      <label class="form-label fw-semibold d-flex align-items-center gap-2">
-        <span class="dept-row-number">${idx}</span>Department Name
-      </label>
-      <input type="text" class="form-control" name="dept_name[]"
-             placeholder="e.g. CSE, AI, ECE" required/>
+document.getElementById("rows").oninput = updateCap;
+document.getElementById("cols").oninput = updateCap;
+updateCap();
+
+function addDeptRow(name="", start="", end="") {
+  const div = document.createElement("div");
+  div.className = "dept-row row g-2 align-items-end";
+  div.innerHTML = `
+    <div class="col-md-4">
+      <label class="form-label small fw-semibold">Department Name</label>
+      <input class="form-control form-control-sm d-name" value="${name}" placeholder="e.g. II IT">
     </div>
-    <div>
-      <label class="form-label fw-semibold">
-        <i class="bi bi-123 me-1 text-accent"></i>From Register No.
-      </label>
-      <input type="text" class="form-control" name="start_reg[]"
-             placeholder="e.g. AI-8001 or 8001" required/>
+    <div class="col-md-3">
+      <label class="form-label small fw-semibold">Start Register No.</label>
+      <input class="form-control form-control-sm d-start" value="${start}" placeholder="811225205045">
     </div>
-    <div>
-      <label class="form-label fw-semibold">
-        <i class="bi bi-123 me-1 text-accent"></i>To Register No.
-      </label>
-      <input type="text" class="form-control" name="end_reg[]"
-             placeholder="e.g. AI-8060 or 8060" required/>
+    <div class="col-md-3">
+      <label class="form-label small fw-semibold">End Register No.</label>
+      <input class="form-control form-control-sm d-end" value="${end}" placeholder="811225205069">
     </div>
-    <div class="dept-remove-col">
-      <label class="form-label fw-semibold" style="visibility:hidden">X</label>
-      <button type="button" class="btn-remove-dept" title="Remove">
-        <i class="bi bi-trash3"></i>
-      </button>
-    </div>`;
-  wrap.querySelector(".btn-remove-dept").addEventListener("click", () => {
-    wrap.remove();
-    toggleEmpty();
-  });
-  return wrap;
+    <div class="col-md-2">
+      <button type="button" class="btn btn-sm btn-outline-danger w-100" onclick="this.closest('.dept-row').remove()">Remove</button>
+    </div>
+  `;
+  document.getElementById("deptContainer").appendChild(div);
 }
 
-function addDept() {
-  departmentList.appendChild(createDeptRow());
-  toggleEmpty();
+function loadSampleTest() {
+  document.getElementById("deptContainer").innerHTML = "";
+  addDeptRow("II IT", "811225205045", "811225205069");
+  addDeptRow("III BME", "811224121026", "811224121047");
+  addDeptRow("II MBA", "811225631022", "811225631024");
 }
+loadSampleTest();
 
-function toggleEmpty() {
-  deptEmptyState.style.display =
-    departmentList.children.length === 0 ? "block" : "none";
-}
-
-/* ── Capacity display ───────────────────────────────────────────── */
-function updateCapacity() {
-  const r = parseInt(rowsInput.value, 10) || 0;
-  const c = parseInt(colsInput.value, 10) || 0;
-  capacityDisplay.textContent = (r * c) > 0 ? `${r * c} seats` : "—";
-}
-
-/* ── Alert helpers ──────────────────────────────────────────────── */
-function showAlert(msg, type = "danger") {
-  alertPlaceholder.innerHTML = `
-    <div class="alert alert-${type} alert-custom alert-dismissible fade show mb-4" role="alert">
-      <i class="bi bi-${type==='danger'?'exclamation-triangle':'check-circle'}-fill me-2"></i>
-      ${esc(msg)}
-      <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-    </div>`;
-  alertPlaceholder.scrollIntoView({ behavior:"smooth", block:"start" });
-}
-function clearAlert() { alertPlaceholder.innerHTML = ""; }
-
-/* ── Form submit ────────────────────────────────────────────────── */
-async function handleSubmit(e) {
+document.getElementById("seatingForm").onsubmit = async (e) => {
   e.preventDefault();
-  clearAlert();
-  if (!seatingForm.checkValidity()) {
-    seatingForm.classList.add("was-validated");
-    showAlert("Please fill in all required fields.");
-    return;
-  }
-  setBusy(true);
+  const alertBox = document.getElementById("alertBox");
+  alertBox.innerHTML = "";
+
+  const fd = new FormData(e.target);
+  const rows = document.querySelectorAll(".dept-row");
+  rows.forEach(r => {
+    fd.append("dept_name[]", r.querySelector(".d-name").value.trim());
+    fd.append("start_reg[]", r.querySelector(".d-start").value.trim());
+    fd.append("end_reg[]", r.querySelector(".d-end").value.trim());
+  });
+
   try {
-    const res  = await fetch("/generate", { method:"POST", body: new FormData(seatingForm) });
+    const res = await fetch("/generate", { method: "POST", body: fd });
     const data = await res.json();
-    if (!res.ok || !data.success) { showAlert(data.error || "Unexpected error."); setBusy(false); return; }
-    generatedHalls = data.halls;
-    lastExamTitle  = document.getElementById("exam_title").value || "End Semester Examination";
-    renderResults(data.halls, data.stats);
+    if (!data.success) throw new Error(data.error);
+
+    curHalls = data.halls;
+    curSettings = data.settings;
+
+    document.getElementById("statsText").textContent = 
+      `Total Students: ${data.stats.total_students} | Total Benches: ${data.stats.total_benches} | Capacity: ${data.stats.capacity}`;
+    document.getElementById("resultsWrapper").classList.remove("d-none");
+    renderSheet();
+    window.scrollTo({ top: document.getElementById("resultsWrapper").offsetTop - 20, behavior: "smooth" });
   } catch (err) {
-    showAlert("Network error: " + err.message);
+    alertBox.innerHTML = `<div class="alert alert-danger py-2">${err.message}</div>`;
   }
-  setBusy(false);
-}
+};
 
-function setBusy(on) {
-  generateBtn.disabled = on;
-  generateBtn.querySelector(".btn-generate-inner").classList.toggle("d-none", on);
-  generateBtn.querySelector(".btn-spinner").classList.toggle("d-none", !on);
-}
+function renderSheet() {
+  const container = document.getElementById("sheetContainer");
+  container.innerHTML = "";
+  const isSingle = (+curSettings.students_per_bench === 1);
 
-/* ── Render results ─────────────────────────────────────────────── */
-function renderResults(halls, stats) {
-  statTotalStudents.textContent = stats.total_students;
-  statTotalHalls.textContent    = stats.total_halls;
-  statDepts.textContent         = Object.keys(stats.dept_counts).length;
-  hallResults.innerHTML         = "";
-  halls.forEach(h => hallResults.appendChild(buildHallCard(h)));
-  resultsSection.style.display  = "block";
-  resultsSection.scrollIntoView({ behavior:"smooth", block:"start" });
-}
+  curHalls.forEach(hall => {
+    const sheet = document.createElement("div");
+    sheet.className = "sheet-preview mb-4";
 
-function buildHallCard(hall) {
-  const card = document.createElement("div");
-  card.className = "hall-card";
-  card.innerHTML = `
-    <div class="hall-card-header">
-      <h3 class="hall-card-title">
-        <i class="bi bi-building"></i>${esc(hall.label)}
-        <span class="hall-badge">${hall.seat_data.length} students</span>
-      </h3>
-      <div class="d-flex gap-2 flex-wrap">
-        <button class="btn btn-sm btn-dl-pdf hall-pdf-btn">
-          <i class="bi bi-file-earmark-pdf me-1"></i>PDF
-        </button>
-        <button class="btn btn-sm btn-dl-excel hall-excel-btn">
-          <i class="bi bi-file-earmark-excel me-1"></i>Excel
-        </button>
+    let html = `
+      <div class="text-center mb-3">
+        <h5 class="fw-bold mb-0 text-uppercase">${curSettings.college_name}</h5>
+        <div class="fw-bold small">${curSettings.exam_title}</div>
+        <div class="small">${curSettings.exam_period || ""}</div>
+        <div class="fw-bold mt-1 text-decoration-underline">SEATING ORDER</div>
       </div>
-    </div>
-    <div class="hall-card-body">
-      <p class="result-section-label"><i class="bi bi-table me-1"></i>Seat Allocation</p>
-      <div class="result-table-wrap mb-4">${buildSeatTable(hall.seat_data)}</div>
-      <p class="result-section-label"><i class="bi bi-grid-3x3 me-1"></i>Hall Layout</p>
-      <div class="layout-grid-wrap">${buildLayoutTable(hall.layout, hall.columns)}</div>
-    </div>`;
-  card.querySelector(".hall-pdf-btn").addEventListener("click", () =>
-    dlFile("/download/pdf",   { halls:[hall], exam_title:lastExamTitle }, `${hall.label}.pdf`));
-  card.querySelector(".hall-excel-btn").addEventListener("click", () =>
-    dlFile("/download/excel", { halls:[hall] }, `${hall.label}.xlsx`));
-  return card;
-}
 
-function buildSeatTable(data) {
-  if (!data || !data.length) return '<p class="text-muted small">No data.</p>';
-  const rows = data.map(r =>
-    `<tr><td>${esc(r.Seat)}</td><td>${esc(r.Department)}</td><td>${esc(r["Register Number"])}</td></tr>`
-  ).join("");
-  return `<table class="result-table">
-    <thead><tr><th>Seat</th><th>Department</th><th>Register Number</th></tr></thead>
-    <tbody>${rows}</tbody></table>`;
-}
+      <div class="row text-center small fw-bold border border-dark py-1 mx-0 mb-3 bg-light">
+        <div class="col-4 border-end border-dark">Session : ${curSettings.session}</div>
+        <div class="col-4 border-end border-dark">Hall No : ${hall.label}</div>
+        <div class="col-4">Exam Date : ${curSettings.exam_date}</div>
+      </div>
+    `;
 
-function buildLayoutTable(layout, columns) {
-  if (!layout || !layout.length) return '<p class="text-muted small">No data.</p>';
-  const heads = columns.map(c => `<th>${esc(c)}</th>`).join("");
-  const bodyRows = layout.map((row, ri) => {
-    const cells = row.map(cell => {
-      const empty = !cell || !cell.trim();
-      return `<td class="${empty?'empty':'occupied'}">${esc(empty?"—":cell)}</td>`;
-    }).join("");
-    return `<tr><td class="row-label">${ri+1}</td>${cells}</tr>`;
-  }).join("");
-  return `<table class="layout-table">
-    <thead><tr><th class="row-header">#</th>${heads}</tr></thead>
-    <tbody>${bodyRows}</tbody></table>`;
-}
+    // Group columns side-by-side
+    html += `<table class="sheet-table mb-4"><thead><tr>`;
+    for (let c = 0; c < hall.cols; c++) {
+      const letter = String.fromCharCode(65 + c);
+      html += `<th colspan="${isSingle ? 2 : 3}">${letter}</th>`;
+    }
+    html += `</tr><tr>`;
 
-/* ── Download helper ────────────────────────────────────────────── */
-async function dlFile(url, payload, filename) {
-  try {
-    const res = await fetch(url, {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(payload),
+    for (let c = 0; c < hall.cols; c++) {
+      const grpBenches = hall.benches.filter(b => b.Column === (c + 1));
+      const d1 = [...new Set(grpBenches.map(b => b["Student 1"] ? b["Student 1"].Department : ""))].filter(Boolean).join(" / ");
+      const d2 = [...new Set(grpBenches.map(b => b["Student 2"] ? b["Student 2"].Department : ""))].filter(Boolean).join(" / ");
+
+      html += `<th style="width:30px;"></th><th>${d1 || "Vacant"}</th>`;
+      if (!isSingle) html += `<th>${d2 || "Vacant"}</th>`;
+    }
+    html += `</tr></thead><tbody>`;
+
+    for (let r = 0; r < hall.rows; r++) {
+      html += `<tr>`;
+      for (let c = 0; c < hall.cols; c++) {
+        const benchNo = c * hall.rows + (r + 1);
+        const b = hall.benches.find(x => x.Bench === benchNo);
+        if (b) {
+          const s1 = b["Student 1"] ? b["Student 1"]["Register Number"] : "";
+          const s2 = b["Student 2"] ? b["Student 2"]["Register Number"] : "";
+          html += `<td class="fw-bold">${b.Bench}</td><td>${s1}</td>`;
+          if (!isSingle) html += `<td>${s2}</td>`;
+        } else {
+          html += `<td></td><td></td>${!isSingle ? '<td></td>' : ''}`;
+        }
+      }
+      html += `</tr>`;
+    }
+    html += `</tbody></table>`;
+
+    // Department summary & signature
+    let deptCounts = {};
+    hall.benches.forEach(b => {
+      ['Student 1', 'Student 2'].forEach(k => {
+        if (b[k] && b[k].Department) {
+          deptCounts[b[k].Department] = (deptCounts[b[k].Department] || 0) + 1;
+        }
+      });
     });
-    if (!res.ok) { const e = await res.json(); showAlert(e.error||"Download failed."); return; }
-    const blob = await res.blob();
-    const a    = document.createElement("a");
-    a.href     = URL.createObjectURL(blob);
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(a.href);
-  } catch(err) { showAlert("Download error: " + err.message); }
+
+    html += `
+      <div class="d-flex justify-content-between align-items-start mt-3">
+        <div style="width: 220px;">
+          <table class="sheet-table">
+            <thead class="bg-light"><tr><th>Department</th><th>Count</th></tr></thead>
+            <tbody>
+              ${Object.entries(deptCounts).map(([d, cnt]) => `<tr><td class="text-start ps-2">${d}</td><td class="fw-bold">${String(cnt).padStart(2, '0')}</td></tr>`).join("")}
+              <tr class="fw-bold bg-light"><td class="text-start ps-2">TOTAL</td><td>${String(hall.student_count).padStart(2, '0')}</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="d-flex justify-content-between text-center mt-5" style="width: 450px;">
+          <div><div style="border-bottom: 1px solid #000; width: 160px; margin-bottom: 4px;"></div><small class="fw-bold">Controller of Examinations</small></div>
+          <div><div style="border-bottom: 1px solid #000; width: 160px; margin-bottom: 4px;"></div><small class="fw-bold">Principal</small></div>
+        </div>
+      </div>
+    `;
+
+    sheet.innerHTML = html;
+    container.appendChild(sheet);
+  });
 }
 
-/* ── Security ───────────────────────────────────────────────────── */
-function esc(s) {
-  if (s == null) return "";
-  return String(s)
-    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
-    .replace(/"/g,"&quot;").replace(/'/g,"&#039;");
+async function downloadFile(type) {
+  const url = type === 'pdf' ? '/download/pdf' : '/download/excel';
+  const fname = type === 'pdf' ? 'Seating_Order.pdf' : 'Seating_Order.xlsx';
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ halls: curHalls, settings: curSettings })
+  });
+  if (!res.ok) { alert(await res.text()); return; }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = fname;
+  a.click();
 }
-
-/* ── Init ───────────────────────────────────────────────────────── */
-document.addEventListener("DOMContentLoaded", () => {
-  departmentList    = document.getElementById("departmentList");
-  deptEmptyState    = document.getElementById("deptEmptyState");
-  alertPlaceholder  = document.getElementById("alertPlaceholder");
-  seatingForm       = document.getElementById("seatingForm");
-  generateBtn       = document.getElementById("generateBtn");
-  resultsSection    = document.getElementById("resultsSection");
-  hallResults       = document.getElementById("hallResults");
-  statTotalStudents = document.getElementById("statTotalStudents");
-  statTotalHalls    = document.getElementById("statTotalHalls");
-  statDepts         = document.getElementById("statDepts");
-  globalPdfBtn      = document.getElementById("globalPdfBtn");
-  globalExcelBtn    = document.getElementById("globalExcelBtn");
-  rowsInput         = document.getElementById("number_of_rows");
-  colsInput         = document.getElementById("number_of_columns");
-  capacityDisplay   = document.getElementById("capacityDisplay");
-
-  addDept(); addDept();  // start with 2 departments
-  document.getElementById("addDeptBtn").addEventListener("click", addDept);
-  rowsInput.addEventListener("input", updateCapacity);
-  colsInput.addEventListener("input", updateCapacity);
-  updateCapacity();
-  seatingForm.addEventListener("submit", handleSubmit);
-  globalPdfBtn.addEventListener("click", () => {
-    if (generatedHalls.length)
-      dlFile("/download/pdf", { halls:generatedHalls, exam_title:lastExamTitle },
-             "Seating_Arrangement.pdf");
-  });
-  globalExcelBtn.addEventListener("click", () => {
-    if (generatedHalls.length)
-      dlFile("/download/excel", { halls:generatedHalls }, "Seating_Arrangement.xlsx");
-  });
-});
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  FLASK ROUTES
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Flask Routes
+# ---------------------------------------------------------------------------
 
-def _parse_form(form) -> dict:
-    """Parse and validate the POST form. Returns a params dict or raises ValueError."""
-    hall_name   = form.get("hall_name",   "Hall").strip()  or "Hall"
-    exam_title  = form.get("exam_title",  "End Semester Examination").strip() \
-                  or "End Semester Examination"
-
-    try:
-        students_per_hall = int(form.get("students_per_hall", 30))
-        rows              = int(form.get("number_of_rows",    6))
-        cols              = int(form.get("number_of_columns", 5))
-    except (ValueError, TypeError):
-        raise ValueError("Students per hall, rows, and columns must be whole numbers.")
-
-    if students_per_hall < 1:
-        raise ValueError("Students per hall must be at least 1.")
-    if rows < 1 or cols < 1:
-        raise ValueError("Rows and columns must each be at least 1.")
-
-    arrangement = form.get("arrangement", "Vertical")
-    if arrangement not in ("Vertical", "Horizontal", "Diamond"):
-        arrangement = "Vertical"
-
-    dept_names = form.getlist("dept_name[]")
-    start_regs = form.getlist("start_reg[]")
-    end_regs   = form.getlist("end_reg[]")
-
-    departments = [
-        {"Department": n.strip(), "Start": s.strip(), "End": e.strip()}
-        for n, s, e in zip(dept_names, start_regs, end_regs)
-    ]
-
-    return {
-        "hall_name":         hall_name,
-        "exam_title":        exam_title,
-        "students_per_hall": students_per_hall,
-        "rows":              rows,
-        "cols":              cols,
-        "arrangement":       arrangement,
-        "departments":       departments,
-    }
-
-
-def _run_pipeline(params: dict) -> list:
-    """Execute the full seating pipeline. Returns halls_data list."""
-    dept_students = build_department_students(params["departments"])
-
-    if not dept_students:
-        raise ValueError(
-            "No valid departments found. "
-            "Please fill in at least one complete department row."
-        )
-
-    students = interleave_departments(dept_students)
-    halls    = split_halls(students, params["students_per_hall"])
-    capacity = params["rows"] * params["cols"]
-    halls_data = []
-
-    for index, hall_students in enumerate(halls):
-        if len(hall_students) > capacity:
-            raise ValueError(
-                f"Hall {index + 1} has {len(hall_students)} students but only "
-                f"{capacity} seats ({params['rows']} rows × {params['cols']} cols). "
-                "Increase rows/columns or reduce students per hall."
-            )
-        label      = f"{params['hall_name']} {column_letter(index)}"
-        layout, seat_data = build_hall_layout(
-            hall_students, params["rows"], params["cols"], params["arrangement"]
-        )
-        col_headers = [column_letter(i) for i in range(params["cols"])]
-        halls_data.append({
-            "label":     label,
-            "seat_data": seat_data,
-            "layout":    layout,
-            "columns":   col_headers,
-        })
-
-    return halls_data
-
-
-@app.route("/", methods=["GET"])
+@app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
 
@@ -1235,59 +802,125 @@ def index():
 @app.route("/generate", methods=["POST"])
 def generate():
     try:
-        params     = _parse_form(request.form)
-        halls_data = _run_pipeline(params)
-        stats      = compute_statistics(halls_data)
-        return jsonify({"success": True, "halls": halls_data, "stats": stats})
-    except ValueError as exc:
-        return jsonify({"success": False, "error": str(exc)}), 400
-    except Exception as exc:
-        return jsonify({"success": False, "error": f"Unexpected error: {exc}"}), 500
+        f = request.form
+        college_name = f.get("college_name", "").strip() or "INDRA GANESAN COLLEGE OF ENGINEERING"
+        exam_title = f.get("exam_title", "").strip() or "Continuous Internal Assessment - I"
+        exam_period = f.get("exam_period", "").strip() or "EXAMINATIONS - NOV/DEC - 2026"
+        session = f.get("session", "FN").strip().upper()
+        exam_date = f.get("exam_date", datetime.now().strftime("%Y-%m-%d")).strip()
+        hall_name = f.get("hall_name", "LB-6").strip()
+
+        students_per_bench = int(f.get("students_per_bench", 2))
+        if students_per_bench not in (1, 2):
+            raise ValueError("Students per bench must be either 1 or 2.")
+
+        rows = max(1, int(f.get("rows", 5)))
+        cols = max(1, int(f.get("cols", 5)))
+        single_hall_cap = rows * cols * students_per_bench
+
+        students_per_hall = int(f.get("students_per_hall", single_hall_cap))
+        max_hall_capacity = min(students_per_hall, single_hall_cap)
+
+        # Department parsing
+        dept_names = f.getlist("dept_name[]")
+        start_regs = f.getlist("start_reg[]")
+        end_regs = f.getlist("end_reg[]")
+
+        raw_depts = []
+        for n, s, e in zip(dept_names, start_regs, end_regs):
+            if n.strip() or s.strip() or e.strip():
+                raw_depts.append({"Department": n.strip(), "Start": s.strip(), "End": e.strip()})
+
+        dept_students = build_department_students(raw_depts)
+        if not dept_students:
+            raise ValueError("Please provide at least one valid department with start and end register numbers.")
+
+        total_students = sum(len(v) for v in dept_students.values())
+        halls_needed = (total_students + max_hall_capacity - 1) // max_hall_capacity
+
+        master_queues = {d: list(regs) for d, regs in dept_students.items()}
+        depts = list(master_queues.keys())
+        halls = []
+
+        for h in range(halls_needed):
+            hall_slots = max_hall_capacity
+            hall_dept_students = {d: [] for d in depts}
+
+            # Prioritize first 2 departments
+            while hall_slots > 0 and any(master_queues[d] for d in depts[:2]):
+                for d in depts[:2]:
+                    if hall_slots <= 0:
+                        break
+                    if master_queues[d]:
+                        hall_dept_students[d].append(master_queues[d].pop(0))
+                        hall_slots -= 1
+
+            # Fill remainder
+            for d in depts[2:]:
+                while hall_slots > 0 and master_queues[d]:
+                    hall_dept_students[d].append(master_queues[d].pop(0))
+                    hall_slots -= 1
+
+            hall_dept_students = {d: v for d, v in hall_dept_students.items() if v}
+            hall_count = sum(len(v) for v in hall_dept_students.values())
+            if hall_count == 0:
+                break
+
+            max_benches = rows * cols
+            raw_benches = make_benches(hall_dept_students, max_benches, students_per_bench)
+            positioned = assign_bench_positions(raw_benches, rows, cols, students_per_bench)
+
+            lbl = hall_name if halls_needed == 1 else f"{hall_name}-{h + 1}"
+            halls.append({
+                "label": lbl,
+                "benches": positioned,
+                "rows": rows,
+                "cols": cols,
+                "student_count": hall_count,
+            })
+
+        return jsonify({
+            "success": True,
+            "halls": halls,
+            "settings": {
+                "college_name": college_name,
+                "exam_title": exam_title,
+                "exam_period": exam_period,
+                "session": session,
+                "exam_date": exam_date,
+                "students_per_bench": students_per_bench,
+            },
+            "stats": {
+                "total_students": total_students,
+                "total_benches": sum(len(h["benches"]) for h in halls),
+                "capacity": single_hall_cap,
+            }
+        })
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Error: {str(e)}"}), 500
 
 
 @app.route("/download/pdf", methods=["POST"])
 def download_pdf():
     try:
-        data       = request.get_json(force=True)
-        halls_data = data.get("halls", [])
-        exam_title = data.get("exam_title", "End Semester Examination")
-        if not halls_data:
-            return jsonify({"error": "No halls data provided."}), 400
-        pdf_bytes = create_pdf(halls_data, exam_title=exam_title)
-        return send_file(
-            io.BytesIO(pdf_bytes),
-            mimetype="application/pdf",
-            as_attachment=True,
-            download_name="Seating_Arrangement.pdf",
-        )
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        data = request.get_json(force=True)
+        pdf = create_pdf(data.get("halls", []), data.get("settings", {}))
+        return send_file(io.BytesIO(pdf), mimetype="application/pdf", as_attachment=True, download_name="Seating_Order.pdf")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/download/excel", methods=["POST"])
 def download_excel():
     try:
-        data       = request.get_json(force=True)
-        halls_data = data.get("halls", [])
-        if not halls_data:
-            return jsonify({"error": "No halls data provided."}), 400
-        xl_bytes = create_excel(halls_data)
-        return send_file(
-            io.BytesIO(xl_bytes),
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            as_attachment=True,
-            download_name="Seating_Arrangement.xlsx",
-        )
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        data = request.get_json(force=True)
+        xl = create_excel(data.get("halls", []), data.get("settings", {}))
+        return send_file(io.BytesIO(xl), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", as_attachment=True, download_name="Seating_Order.xlsx")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-import os
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000)),
-        debug=False
-    )
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
